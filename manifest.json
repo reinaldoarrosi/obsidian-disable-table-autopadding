@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-disable-table-autopadding",
+  "name": "Disable Table Autopadding",
+  "version": "0.0.1",
+  "minAppVersion": "1.5.0",
+  "description": "Allows controling if tables in Obsidian are autopadded or not.",
+  "author": "Reinaldo Arrosi",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
