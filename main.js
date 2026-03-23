@@ -1,254 +1,182 @@
-const { Plugin, TFile, PluginSettingTab, Setting } = require("obsidian");
+const { Plugin } = require("obsidian");
 
-const DEFAULT_SETTINGS = {
-  autoNormalizeOnSave: false,
-};
-
-function isFenceLine(trimmed) {
-  return trimmed.startsWith("```") || trimmed.startsWith("~~~");
-}
-
-function countBackticks(line, start) {
-  let count = 0;
-  while (start + count < line.length && line[start + count] === "`") {
-    count++;
+/** Prototype shape of Obsidian’s in-editor markdown table widget (names preserved in release builds). */
+function findTableWidgetPrototype(obj) {
+  for (
+    let p = obj;
+    p && p !== Object.prototype;
+    p = Object.getPrototypeOf(p)
+  ) {
+    if (
+      typeof p.setCellFocus === "function" &&
+      typeof p.dispatchTable === "function" &&
+      typeof p.rebuildTable === "function" &&
+      typeof p.receiveCellFocus === "function"
+    ) {
+      return p;
+    }
   }
-  return count;
+  return null;
 }
 
-function splitByPipes(line) {
-  const cells = [];
-  let current = "";
-  let i = 0;
-  let inWikilink = false;
-  let inCode = false;
-  let codeTicks = 0;
+const SAFE_GETTER_KEYS = new Set([
+  "activeEditor",
+  "activeLeaf",
+  "cm",
+  "containerEl",
+  "editMode",
+  "editor",
+  "leaf",
+  "mode",
+  "parent",
+  "previewMode",
+  "view",
+]);
 
-  while (i < line.length) {
-    const ch = line[i];
-    const next = i + 1 < line.length ? line[i + 1] : "";
-
-    if (!inCode && !inWikilink && ch === "\\" && next === "|") {
-      current += "\\|";
-      i += 2;
-      continue;
+/**
+ * Walks a bounded object graph from workspace roots to find the table widget prototype.
+ * Getters are only invoked for a small whitelist to avoid side effects from arbitrary accessors.
+ */
+function enqueueEditorSurfaces(ed, enqueue) {
+  if (!ed || typeof ed !== "object") return;
+  enqueue(ed);
+  for (const k of ["cm", "tableCell", "content", "view"]) {
+    try {
+      enqueue(ed[k]);
+    } catch {
+      /* ignore */
     }
+  }
+}
 
-    if (!inCode && ch === "[" && next === "[") {
-      inWikilink = true;
-      current += "[[";
-      i += 2;
-      continue;
+function discoverTablePrototype(app, maxSteps = 20000) {
+  const visited = new WeakSet();
+  const queue = [];
+
+  function enqueue(v) {
+    if (v == null) return;
+    const t = typeof v;
+    if (t !== "object" && t !== "function") return;
+    if (visited.has(v)) return;
+    visited.add(v);
+    queue.push(v);
+  }
+
+  try {
+    enqueue(app);
+    enqueue(app.workspace);
+    const w = app.workspace;
+    enqueue(w.activeLeaf);
+    enqueue(w.activeEditor);
+    try {
+      enqueueEditorSurfaces(w.activeEditor?.editor, enqueue);
+    } catch {
+      /* ignore */
     }
-
-    if (inWikilink && ch === "]" && next === "]") {
-      inWikilink = false;
-      current += "]]";
-      i += 2;
-      continue;
-    }
-
-    if (!inWikilink && ch === "`") {
-      const ticks = countBackticks(line, i);
-      current += "`".repeat(ticks);
-      i += ticks;
-      if (!inCode) {
-        inCode = true;
-        codeTicks = ticks;
-      } else if (ticks === codeTicks) {
-        inCode = false;
-        codeTicks = 0;
+    for (const leaf of w.getLeavesOfType("markdown")) {
+      enqueue(leaf);
+      enqueue(leaf.view);
+      try {
+        enqueue(leaf.view?.editMode);
+        enqueue(leaf.view?.previewMode);
+        enqueueEditorSurfaces(leaf.view?.editor, enqueue);
+      } catch {
+        /* ignore */
       }
-      continue;
     }
-
-    if (!inCode && !inWikilink && ch === "|") {
-      cells.push(current);
-      current = "";
-      i++;
-      continue;
+    try {
+      const v = w.activeLeaf?.view;
+      enqueueEditorSurfaces(v?.editor, enqueue);
+    } catch {
+      /* ignore */
     }
-
-    current += ch;
-    i++;
+  } catch {
+    /* ignore */
   }
 
-  cells.push(current);
-  return cells;
-}
+  let steps = 0;
+  while (queue.length && steps++ < maxSteps) {
+    const cur = queue.shift();
+    const hit = findTableWidgetPrototype(cur);
+    if (hit) return hit;
 
-function formatCell(text) {
-  if (text.length === 0) return " ";
-  return ` ${text} `;
-}
+    let keys;
+    try {
+      keys = Reflect.ownKeys(cur);
+    } catch {
+      continue;
+    }
 
-function isSeparatorCell(text) {
-  return /^:?-{3,}:?$/.test(text);
-}
-
-function normalizeSeparatorCell(text) {
-  const trimmed = text.trim();
-  const left = trimmed.startsWith(":");
-  const right = trimmed.endsWith(":");
-  if (left && right) return ":---:";
-  if (left) return ":---";
-  if (right) return "---:";
-  return "---";
-}
-
-function normalizeTableLine(line) {
-  const prefixMatch = line.match(/^(\s*(?:>+\s*)*)/);
-  const prefix = prefixMatch ? prefixMatch[1] : "";
-  const content = line.slice(prefix.length);
-  const trimmed = content.trim();
-
-  if (!trimmed.includes("|")) return line;
-  if (!(trimmed.startsWith("|") && trimmed.endsWith("|"))) return line;
-
-  const rawCells = splitByPipes(trimmed);
-  if (rawCells.length < 3) return line;
-
-  let cells = rawCells;
-  cells = cells.slice(1, cells.length - 1);
-  const normalizedCells = cells.map((cell) => cell.trim());
-  const isSeparatorRow = normalizedCells.every(isSeparatorCell);
-  const finalCells = isSeparatorRow
-    ? normalizedCells.map(normalizeSeparatorCell)
-    : normalizedCells;
-  const normalized = `${prefix}|${finalCells.map(formatCell).join("|")}|`;
-
-  return normalized;
-}
-
-function normalizeTables(text) {
-  const lines = text.split(/\r?\n/);
-  const result = [];
-  let inFence = false;
-  let fenceMarker = "";
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (isFenceLine(trimmed)) {
-      if (!inFence) {
-        inFence = true;
-        fenceMarker = trimmed.startsWith("```") ? "```" : "~~~";
-      } else if (trimmed.startsWith(fenceMarker)) {
-        inFence = false;
-        fenceMarker = "";
+    for (const key of keys) {
+      if (typeof key === "symbol") continue;
+      let desc;
+      try {
+        desc = Object.getOwnPropertyDescriptor(cur, key);
+      } catch {
+        continue;
       }
-      result.push(line);
-      continue;
-    }
+      if (!desc) continue;
 
-    if (inFence) {
-      result.push(line);
-      continue;
-    }
+      if (typeof desc.get === "function") {
+        if (SAFE_GETTER_KEYS.has(String(key))) {
+          try {
+            enqueue(desc.get.call(cur));
+          } catch {
+            /* ignore */
+          }
+        }
+        continue;
+      }
 
-    result.push(normalizeTableLine(line));
+      const val = desc.value;
+      if (val == null) continue;
+
+      if (Array.isArray(val)) {
+        const cap = Math.min(val.length, 64);
+        for (let i = 0; i < cap; i++) enqueue(val[i]);
+        continue;
+      }
+
+      if (typeof val === "object") enqueue(val);
+    }
   }
 
-  return result.join("\n");
+  return null;
 }
 
-class TableAutopaddingSettingTab extends PluginSettingTab {
-  constructor(app, plugin) {
-    super(app, plugin);
-    this.plugin = plugin;
-  }
-
-  display() {
-    const { containerEl } = this;
-    containerEl.empty();
-    new Setting(containerEl)
-      .setName("Auto-normalize tables on save")
-      .setDesc(
-        "When enabled, tables in the current file are normalized (padding removed) automatically whenever you save the file."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.autoNormalizeOnSave)
-          .onChange(async (value) => {
-            this.plugin.settings.autoNormalizeOnSave = value;
-            await this.plugin.saveSettings();
-          })
-      );
-  }
-}
-
-module.exports = class TableAutopaddingRemover extends Plugin {
-  get settings() {
-    return this._settings || DEFAULT_SETTINGS;
-  }
-
-  set settings(value) {
-    this._settings = value;
-  }
-
-  async loadSettings() {
-    this.settings = { ...DEFAULT_SETTINGS, ...(await this.loadData()) };
-  }
-
-  async saveSettings() {
-    await this.saveData(this.settings);
-  }
+module.exports = class DisableTableAutopaddingPlugin extends Plugin {
+  /** @type {{ proto: object, original: function } | null} */
+  patch = null;
 
   onload() {
-    this.processing = new Set();
-    this.loadSettings();
+    const run = () => this.applyTableFocusPatch();
 
-    this.addSettingTab(new TableAutopaddingSettingTab(this.app, this));
-
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        if (!this.settings.autoNormalizeOnSave) return;
-        if (!(file instanceof TFile) || file.extension !== "md") return;
-        this.normalizeFile(file);
-      })
-    );
-
-    this.addCommand({
-      id: "normalize-current-file",
-      name: "Normalize tables in current file",
-      checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file) return false;
-        if (checking) return true;
-        this.normalizeFile(file);
-        return true;
-      },
-    });
-
-    this.addCommand({
-      id: "normalize-all-files",
-      name: "Normalize tables in all markdown files",
-      callback: () => this.normalizeAllFiles(),
-    });
+    run();
+    this.registerEvent(this.app.workspace.on("active-leaf-change", run));
+    this.registerEvent(this.app.workspace.on("layout-change", run));
+    this.registerEvent(this.app.workspace.on("file-open", run));
   }
 
-  async normalizeFile(file) {
-    if (!(file instanceof TFile)) return;
-    if (file.extension !== "md") return;
-    if (this.processing.has(file.path)) return;
+  applyTableFocusPatch() {
+    if (this.patch) return;
 
-    const text = await this.app.vault.read(file);
-    const normalized = normalizeTables(text);
-    if (normalized === text) return;
+    const proto = discoverTablePrototype(this.app);
+    if (!proto) return;
 
-    this.processing.add(file.path);
-    try {
-      await this.app.vault.modify(file, normalized);
-    } finally {
-      this.processing.delete(file.path);
+    const original = proto.setCellFocus;
+    if (typeof original !== "function") return;
+
+    proto.setCellFocus = function (row, col, selectionFn) {
+      return this.receiveCellFocus(row, col, selectionFn, true);
+    };
+
+    this.patch = { proto, original };
+  }
+
+  onunload() {
+    if (this.patch) {
+      this.patch.proto.setCellFocus = this.patch.original;
+      this.patch = null;
     }
   }
-
-  async normalizeAllFiles() {
-    const files = this.app.vault.getMarkdownFiles();
-    for (const file of files) {
-      // Sequential to avoid heavy vault churn
-      // eslint-disable-next-line no-await-in-loop
-      await this.normalizeFile(file);
-    }
-  }
-};
+}
